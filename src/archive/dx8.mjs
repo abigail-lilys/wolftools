@@ -2,6 +2,7 @@ import { lstat, mkdir, open, readdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 import { DX8_MODES } from "../constants.mjs";
+import { applyWolfCryptV35, prepareWolfV35Archive } from "./wolfcrypt-v35.mjs";
 import { align4, ensureSlice, readU64, writeU64 } from "./binary.mjs";
 import { decodeHuffman, inspectHuffman } from "./huffman.mjs";
 import { decodeLz } from "./lz.mjs";
@@ -29,6 +30,12 @@ const CRC32_TABLE = Array.from({ length: 256 }, (_, value) => {
 });
 
 async function readAt(handle, position, size, label) {
+  if (Buffer.isBuffer(handle)) {
+    if (!Number.isSafeInteger(position) || !Number.isSafeInteger(size) || position < 0 || size < 0 || position + size > handle.length) {
+      throw new Error(`${label} is outside the archive.`);
+    }
+    return Buffer.from(handle.subarray(position, position + size));
+  }
   const buffer = Buffer.alloc(size);
   let offset = 0;
   while (offset < size) {
@@ -84,9 +91,12 @@ function parseHeader(buffer, archiveBytes) {
     directoryTableStart: readU64(buffer, 32),
     codePage: buffer.readUInt32LE(40),
     flags: buffer.readUInt32LE(44),
+    cryptVersion: buffer.readUInt32LE(44) >>> 16,
     huffmanEncodeKB: buffer[48],
   };
-  if ((header.flags >>> 16) !== 0) throw new Error("This archive uses a newer WOLF crypt format.");
+  if (header.cryptVersion !== 0 && header.cryptVersion !== 0x015e) {
+    throw new Error("This archive uses an unsupported WOLF crypt format.");
+  }
   if (header.dataStart !== HEADER_SIZE) throw new Error("Unsupported DX data start address.");
   if (
     header.nameTableStart < HEADER_SIZE ||
@@ -163,22 +173,28 @@ function validateTables(tables, header) {
   return { nameTable, fileTable, directoryTable };
 }
 
-async function loadTables(archive, header, archiveBytes) {
+async function loadTables(archive, header, archiveBytes, v35Context = undefined) {
   const noKey = (header.flags & NO_KEY) !== 0;
   const noHeadPress = (header.flags & NO_HEAD_PRESS) !== 0;
+  const v35 = header.cryptVersion === 0x015e;
+  if (v35 && !v35Context?.specialKey) throw new Error("WOLF v3.50 crypt context was not initialized.");
   const storedSize = noHeadPress ? header.headSize : archiveBytes - header.nameTableStart;
   if (!Number.isSafeInteger(storedSize) || storedSize <= 0) {
     throw new Error("The DX archive table storage size is invalid.");
   }
   const stored = await readAt(archive, header.nameTableStart, storedSize, "Archive tables");
-  const candidates = noKey
-    ? [{ name: "clear", label: "Clear DX8", key: undefined }]
-    : DX8_MODES.map((mode) => ({ ...mode, key: mode.key.subarray(0, MAX_KEY_STRING) }));
+  const candidates = v35
+    ? [{ name: "3.50", label: "Wolf RPG 3.50 compatible", key: undefined }]
+    : noKey
+      ? [{ name: "clear", label: "Clear DX8", key: undefined }]
+      : DX8_MODES.map((mode) => ({ ...mode, key: mode.key.subarray(0, MAX_KEY_STRING) }));
 
   for (const mode of candidates) {
     try {
       const archiveKey = mode.key ? createDx8Key(mode.key) : undefined;
-      const decrypted = xorDx8(stored, archiveKey, 0);
+      const decrypted = v35
+        ? applyWolfCryptV35(stored, v35Context.specialKey, 0)
+        : xorDx8(stored, archiveKey, 0);
       let tables;
       if (noHeadPress) {
         tables = decrypted;
@@ -189,15 +205,21 @@ async function loadTables(archive, header, archiveBytes) {
         }
         tables = decodeLz(decodeHuffman(decrypted, huffman.originalSize), header.headSize);
       }
-      return { ...validateTables(tables, header), archiveKey, mode, keyString: mode.key };
-    } catch {
+      return {
+        ...validateTables(tables, header),
+        archiveKey, mode, keyString: mode.key,
+        specialKey: v35 ? v35Context.specialKey : undefined,
+      };
+    } catch (error) {
+      if (v35) throw error;
       continue;
     }
   }
   throw new Error("The DX version 8 archive key or table format is not supported.");
 }
 
-function createFileKey({ keyString, directory, file, nameTable, fileTable, directoryTable }) {
+function createFileKey({ keyString, directory, file, nameTable, fileTable, directoryTable, cryptVersion, specialKey }) {
+  if (cryptVersion === 0x015e) return specialKey;
   if (!keyString) return undefined;
   const parts = [keyString, normalizedNameBytes(nameTable, file.nameAddress)];
   let current = directory;
@@ -220,6 +242,12 @@ function storedFileSize(file, header) {
   return file.huffPressDataSize;
 }
 
+function decryptPayload(source, key, position, cryptVersion) {
+  return cryptVersion === 0x015e
+    ? applyWolfCryptV35(source, key, position)
+    : xorDx8(source, key, position);
+}
+
 async function readDecodedFile({ archive, header, file, key, dataPosition }) {
   const baseSize = file.pressDataSize ?? file.dataSize;
   let base;
@@ -230,7 +258,7 @@ async function readDecodedFile({ archive, header, file, key, dataPosition }) {
       file.huffPressDataSize,
       "Huffman file data",
     );
-    const huffman = xorDx8(encryptedHuffman, key, file.dataSize);
+    const huffman = decryptPayload(encryptedHuffman, key, file.dataSize, header.cryptVersion);
     const edgeSize = header.huffmanEncodeKB * 1024;
     const partial = header.huffmanEncodeKB !== 0xff && baseSize > edgeSize * 2;
     if (partial) {
@@ -242,7 +270,7 @@ async function readDecodedFile({ archive, header, file, key, dataPosition }) {
         middleSize,
         "Partially compressed file data",
       );
-      const middle = xorDx8(encryptedMiddle, key, file.dataSize + file.huffPressDataSize);
+      const middle = decryptPayload(encryptedMiddle, key, file.dataSize + file.huffPressDataSize, header.cryptVersion);
       base = Buffer.alloc(baseSize);
       edges.copy(base, 0, 0, edgeSize);
       middle.copy(base, edgeSize);
@@ -252,7 +280,7 @@ async function readDecodedFile({ archive, header, file, key, dataPosition }) {
     }
   } else {
     const encrypted = await readAt(archive, dataPosition, baseSize, "Compressed file data");
-    base = xorDx8(encrypted, key, file.dataSize);
+    base = decryptPayload(encrypted, key, file.dataSize, header.cryptVersion);
   }
   return file.pressDataSize === undefined ? base : decodeLz(base, file.dataSize);
 }
@@ -276,7 +304,7 @@ async function writeDecodedFile({ archive, header, file, key, outputPath }) {
     while (offset < file.dataSize) {
       const size = Math.min(IO_SIZE, file.dataSize - offset);
       const encrypted = await readAt(archive, dataPosition + offset, size, "File data");
-      const bytes = xorDx8(encrypted, key, file.dataSize + offset);
+      const bytes = decryptPayload(encrypted, key, file.dataSize + offset, header.cryptVersion);
       await output.write(bytes, 0, bytes.length, offset);
       offset += size;
     }
@@ -286,11 +314,18 @@ async function writeDecodedFile({ archive, header, file, key, outputPath }) {
 }
 
 export async function inspectDx8Archive(archivePath) {
-  const archive = await open(archivePath, "r");
+  const archiveHandle = await open(archivePath, "r");
+  let archive = archiveHandle;
   try {
-    const details = await archive.stat();
+    const details = await archiveHandle.stat();
+    const firstHeader = await readAt(archiveHandle, 0, HEADER_SIZE, "Archive header");
+    let v35Context;
+    if ((firstHeader.readUInt32LE(44) >>> 16) === 0x015e) {
+      v35Context = prepareWolfV35Archive(await readAt(archiveHandle, 0, details.size, "WOLF v3.50 archive"));
+      archive = v35Context.archive;
+    }
     const header = parseHeader(await readAt(archive, 0, HEADER_SIZE, "Archive header"), details.size);
-    const tables = await loadTables(archive, header, details.size);
+    const tables = await loadTables(archive, header, details.size, v35Context);
     return {
       archiveVersion: 8,
       encrypted: (header.flags & NO_KEY) === 0,
@@ -298,26 +333,29 @@ export async function inspectDx8Archive(archivePath) {
       mode: tables.mode,
     };
   } finally {
-    await archive.close();
+    await archiveHandle.close();
   }
 }
-
 export async function unpackDx8Archive(archivePath, outputDir) {
-  const archive = await open(archivePath, "r");
+  const archiveHandle = await open(archivePath, "r");
+  let archive = archiveHandle;
   try {
-    const details = await archive.stat();
-    const header = parseHeader(
-      await readAt(archive, 0, HEADER_SIZE, "Archive header"),
-      details.size,
-    );
-    const { nameTable, fileTable, directoryTable, mode, keyString } = await loadTables(
+    const details = await archiveHandle.stat();
+    const firstHeader = await readAt(archiveHandle, 0, HEADER_SIZE, "Archive header");
+    let v35Context;
+    if ((firstHeader.readUInt32LE(44) >>> 16) === 0x015e) {
+      v35Context = prepareWolfV35Archive(await readAt(archiveHandle, 0, details.size, "WOLF v3.50 archive"));
+      archive = v35Context.archive;
+    }
+    const header = parseHeader(await readAt(archive, 0, HEADER_SIZE, "Archive header"), details.size);
+    const { nameTable, fileTable, directoryTable, mode, keyString, specialKey } = await loadTables(
       archive,
       header,
       details.size,
+      v35Context,
     );
     const visited = new Set();
     let files = 0;
-
     async function extractDirectory(directoryOffset, destination) {
       if (visited.has(directoryOffset)) throw new Error("The archive directory tree contains a cycle.");
       visited.add(directoryOffset);
@@ -343,20 +381,25 @@ export async function unpackDx8Archive(archivePath, outputDir) {
             nameTable,
             fileTable,
             directoryTable,
+            cryptVersion: header.cryptVersion,
+            specialKey,
           });
           await writeDecodedFile({ archive, header, file, key, outputPath: path });
           files += 1;
         }
       }
     }
-
     await extractDirectory(0, outputDir);
-    return { files, archiveVersion: 8, encrypted: Boolean(keyString), mode };
+    return {
+      files,
+      archiveVersion: 8,
+      encrypted: (header.flags & NO_KEY) === 0,
+      mode,
+    };
   } finally {
-    await archive.close();
+    await archiveHandle.close();
   }
 }
-
 export const unpackDx8NoKeyArchive = unpackDx8Archive;
 
 async function scanDirectory(path, name = "") {

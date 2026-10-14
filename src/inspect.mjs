@@ -79,7 +79,7 @@ export async function inspectFile(path) {
   const flags = start.readUInt32LE(44);
   const cryptVersion = flags >>> 16;
   let dx8;
-  if (archiveVersion === 8 && cryptVersion === 0) {
+  if (archiveVersion === 8 && (cryptVersion === 0 || cryptVersion === 0x015e)) {
     dx8 = await inspectDx8Archive(file).catch(() => undefined);
   }
   return {

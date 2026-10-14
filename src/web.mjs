@@ -11,13 +11,12 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 
 import JSZip from "jszip";
 
 import { packDx8NoKeyArchive } from "./archive/dx8.mjs";
-import { unpackWolf } from "./unpack.mjs";
 
 export const BROWSER_WODITOR_VERSION = "0.6.2.0";
 export const BROWSER_WODITOR_URL =
@@ -105,31 +104,81 @@ function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+async function downloadRuntimeZip(runtimeUrl) {
+  process.stdout.write(`Downloading Browser Woditor ${BROWSER_WODITOR_VERSION}...\n`);
+  const response = await fetch(runtimeUrl, { redirect: "follow" });
+  if (!response.ok) {
+    throw new Error(`Browser Woditor download failed (${response.status} ${response.statusText}).`);
+  }
+  return Buffer.from(await response.arrayBuffer());
+}
+
 async function loadRuntimeZip({ runtimeZipPath, runtimeUrl, runtimeSha256 }) {
+  const cachePath = join(
+    homedir(),
+    ".cache",
+    "wolftools",
+    `BrowserWoditor_${BROWSER_WODITOR_VERSION.replaceAll(".", "_")}.zip`,
+  );
+
   let bytes;
+  let fromCache = false;
+  let shouldCache = false;
+
   if (runtimeZipPath) {
     bytes = await readFile(resolve(runtimeZipPath));
   } else {
-    process.stdout.write(`Downloading Browser Woditor ${BROWSER_WODITOR_VERSION}...\n`);
-    const response = await fetch(runtimeUrl, { redirect: "follow" });
-    if (!response.ok) {
-      throw new Error(`Browser Woditor download failed (${response.status} ${response.statusText}).`);
+    try {
+      bytes = await readFile(cachePath);
+      fromCache = true;
+      process.stdout.write(`Using cached Browser Woditor ${BROWSER_WODITOR_VERSION}.\n`);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      bytes = await downloadRuntimeZip(runtimeUrl);
+      shouldCache = true;
     }
-    bytes = Buffer.from(await response.arrayBuffer());
   }
 
-  if (runtimeSha256) {
-    const actualHash = sha256(bytes);
-    if (actualHash.toLowerCase() !== runtimeSha256.toLowerCase()) {
+  const matchesChecksum = (candidate) =>
+    !runtimeSha256 ||
+    sha256(candidate).toLowerCase() === runtimeSha256.toLowerCase();
+
+  if (!matchesChecksum(bytes)) {
+    if (!runtimeZipPath && fromCache) {
+      process.stdout.write("Cached Browser Woditor checksum mismatch; downloading a fresh copy.\n");
+      await rm(cachePath, { force: true });
+      bytes = await downloadRuntimeZip(runtimeUrl);
+
+      const actualHash = sha256(bytes);
+      if (runtimeSha256 && actualHash.toLowerCase() !== runtimeSha256.toLowerCase()) {
+        throw new Error(
+          `Browser Woditor ZIP checksum mismatch. Expected ${runtimeSha256}, received ${actualHash}.`,
+        );
+      }
+      shouldCache = true;
+    } else {
+      const actualHash = sha256(bytes);
       throw new Error(
         `Browser Woditor ZIP checksum mismatch. Expected ${runtimeSha256}, received ${actualHash}.`,
       );
     }
   }
 
+  if (shouldCache) {
+    await mkdir(dirname(cachePath), { recursive: true });
+    const temporaryPath = `${cachePath}.tmp-${randomUUID()}`;
+    try {
+      await writeFile(temporaryPath, bytes);
+      await rename(temporaryPath, cachePath);
+    } catch (error) {
+      await rm(temporaryPath, { force: true });
+      throw error;
+    }
+    process.stdout.write(`Cached Browser Woditor at ${cachePath}\n`);
+  }
+
   return JSZip.loadAsync(bytes);
 }
-
 async function extractRuntime(zip, outputDir) {
   const entries = Object.values(zip.files).filter(
     (entry) => !entry.dir && entry.name.startsWith(RUNTIME_PREFIX),
@@ -245,7 +294,7 @@ export function lazyAssetLoaderSource() {
       if (
         lower.includes("data/") &&
         /\.[^/.]{1,8}$/u.test(requested) &&
-        !/-(?:gamecache|save)\//iu.test(requested) &&
+        !/-(?:gamecache|save)$/iu.test(requested) &&
         !lower.endsWith(".wolf") &&
         !lower.endsWith(".wolfx") &&
         !reportedMissing.has(lower)
@@ -337,7 +386,7 @@ function settingsSource(projectId, title) {
     requestFullScreen: false,
     lockOrientation: "landscape-primary",
     hideHeaderFooter: true,
-    hideSideButtons: true,
+    hideSideButtons: false,
     switchUILeftRight: false,
     limitFPS: 60,
 };
@@ -355,14 +404,18 @@ async function normalizeSourceDir(sourcePath) {
 
 async function sourceKind(sourceDir) {
   await requireDirectory(sourceDir, "Game or prepared release folder");
+
+  const hasDataFolder = await exists(join(sourceDir, "Data"));
+  let hasGameExecutable = false;
   for (const name of ["Game.exe", "GamePro.exe"]) {
     if (await exists(join(sourceDir, name))) {
-      if (!(await exists(join(sourceDir, "Data"))) && !(await exists(join(sourceDir, "Data.wolf")))) {
-        throw new Error("The game has neither a Data folder nor Data.wolf.");
-      }
-      return "native";
+      hasGameExecutable = true;
+      break;
     }
   }
+
+  // A game folder with Data/ must use the clean-data validation path.
+  if (hasDataFolder || hasGameExecutable) return "native";
 
   await requireFile(join(sourceDir, "Data.wolf"), "Browser Woditor ready Data.wolf");
   await requireFile(join(sourceDir, "Game.ini"), "Game.ini");
@@ -409,18 +462,55 @@ async function createAssetManifest(dataDir) {
   return { version: 1, files, bytes };
 }
 
-async function createLooseBrowserData(sourceDir, outputDir, runtimeZip) {
-  const workRoot = await mkdtemp(join(tmpdir(), "wolftools web "));
-  const unpackedGame = join(workRoot, "game");
-  const bootData = join(workRoot, "boot");
-  try {
-    process.stdout.write("Unpacking source archives...\n");
-    await unpackWolf({ sourcePath: sourceDir, outputDir: unpackedGame });
-    const dataDir = join(unpackedGame, "Data");
-    await requireDirectory(dataDir, "Unpacked Data folder");
 
+async function requireCleanDataFolder(sourceDir) {
+  const dataDir = join(sourceDir, "Data");
+
+  if (!(await exists(dataDir))) {
+    throw new Error(
+      `Web export requires a prepared Data/ folder, but none was found in: ${sourceDir}\n` +
+      "Unpack all .wolf archives into Data/, preserve their relative folder structure, " +
+      "and remove the .wolf files before retrying."
+    );
+  }
+
+  await requireDirectory(dataDir, "Prepared Game Data folder");
+
+  const archives = (await listFiles(dataDir))
+    .filter((path) => extname(path).toLowerCase() === ".wolf");
+
+  if (archives.length > 0) {
+    const shown = archives.slice(0, 10)
+      .map((path) => `  Data/${path}`)
+      .join("\n");
+    const more = archives.length > 10
+      ? `\n  ... and ${archives.length - 10} more`
+      : "";
+
+    throw new Error(
+      `Data/ is not clean: found ${archives.length} .wolf archive(s).\n` +
+      "Unpack each archive into Data/ at the matching relative path, then remove " +
+      "the .wolf files and retry.\n" +
+      `${shown}${more}`
+    );
+  }
+
+  return dataDir;
+}
+
+async function createLooseBrowserData(sourceDir, outputDir, runtimeZip, dataDir) {
+  const workRoot = await mkdtemp(join(tmpdir(), "wolftools web "));
+  const bootData = join(workRoot, "boot");
+
+  try {
+    process.stdout.write("Using prepared, clean Data folder...\n");
     process.stdout.write("Copying browser assets...\n");
-    await cp(dataDir, join(outputDir, "Data"), { recursive: true, dereference: true });
+
+    await cp(dataDir, join(outputDir, "Data"), {
+      recursive: true,
+      dereference: true,
+    });
+
     const manifest = await createAssetManifest(join(outputDir, "Data"));
     await writeFile(
       join(outputDir, "asset_manifest.json"),
@@ -429,13 +519,17 @@ async function createLooseBrowserData(sourceDir, outputDir, runtimeZip) {
 
     const markerDir = join(bootData, "BasicData");
     await mkdir(markerDir, { recursive: true });
-    await writeFile(join(markerDir, "BrowserWoditor.dat"), await browserWoditorMarker(runtimeZip));
+    await writeFile(
+      join(markerDir, "BrowserWoditor.dat"),
+      await browserWoditorMarker(runtimeZip),
+    );
 
     process.stdout.write("Creating the small browser startup archive...\n");
     await rm(join(outputDir, "Data.wolf"), { force: true });
     await packDx8NoKeyArchive(bootData, join(outputDir, "Data.wolf"));
     await copyGameSupportFiles(sourceDir, outputDir);
     await addLazyAssetLoader(outputDir);
+
     return manifest;
   } finally {
     await rm(workRoot, { recursive: true, force: true });
@@ -459,6 +553,9 @@ export async function packageWolfGame({
   }
 
   const kind = await sourceKind(source);
+  const preparedDataDir = kind === "native"
+    ? await requireCleanDataFolder(source)
+    : undefined;
   const gameTitle = basename(source).trim();
   const saveProjectId = safeProjectId(gameTitle);
   const staging = join(dirname(destination), `.${basename(destination)}.tmp-${randomUUID()}`);
@@ -470,7 +567,7 @@ export async function packageWolfGame({
     await extractRuntime(runtimeZip, staging);
     let data;
     if (kind === "native") {
-      const manifest = await createLooseBrowserData(source, staging, runtimeZip);
+      const manifest = await createLooseBrowserData(source, staging, runtimeZip, preparedDataDir);
       data = {
         delivery: "files",
         manifest: "asset_manifest.json",
