@@ -2,3 +2,7 @@ node_modules/
 output/
 coverage/
 .DS_Store
+# Local debugging and source backups
+*.bak
+*.pre-*
+*.before_*

@@ -151,3 +151,24 @@ guidelines. Its runtime files are not included in this repository.
 Archive compatibility depends on the WOLF RPG Editor version and encryption
 mode. Some WOLF 3 releases, WOLF Pro releases, and games with custom protection
 use a different crypt format.
+
+## Fork Features and Experimental Support
+
+This fork includes the following changes:
+
+- **Experimental WOLF RPG Editor v3.50 support.** Archive handling
+  has been extended with a dedicated v3.50 crypt module. Compatibility
+  is still experimental; the current automated tests cover three
+  cryptographic primitives, not every archive or complete game.
+- **Browser Woditor runtime cache.** When the web command downloads
+  Browser Woditor from its default URL, the ZIP is cached under
+  `~/.cache/wolftools/`. Later exports reuse the cached version.
+  The checksum is verified, and an invalid cached ZIP triggers a
+  fresh download. The runtime is not bundled with this repository.
+- **Browser compatibility fixes.** Generated web exports use the
+  corrected lazy asset path filter and set `hideSideButtons` to
+  `false`, keeping the side buttons visible.
+
+These changes are maintained in this fork and may differ from the
+upstream project. Test with copies of game data before relying on
+experimental archive support for important projects.
