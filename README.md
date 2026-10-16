@@ -169,6 +169,11 @@ This fork includes the following changes:
   corrected lazy asset path filter and set `hideSideButtons` to
   `false`, keeping the side buttons visible.
 
+- **JoiPlay resolution crop fix.** The export pipeline applies a hash-guarded
+  resolution patch to the verified Browser Woditor 0.6.2.0 WASM; see [the fix
+  notes](docs/joiplay-resolution-crop-fix.md) for the root cause and validation
+  steps.
+
 These changes are maintained in this fork and may differ from the
 upstream project. Test with copies of game data before relying on
 experimental archive support for important projects.

@@ -15,6 +15,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 
 import JSZip from "jszip";
+import { patchBrowserWoditorResolution } from "./browser-woditor-resolution.mjs";
 
 import { packDx8NoKeyArchive } from "./archive/dx8.mjs";
 
@@ -193,7 +194,12 @@ async function extractRuntime(zip, outputDir) {
   for (const entry of entries) {
     const outputPath = join(outputDir, entry.name.slice(RUNTIME_PREFIX.length));
     await mkdir(dirname(outputPath), { recursive: true });
-    await writeFile(outputPath, await entry.async("nodebuffer"));
+
+    const content = await entry.async("nodebuffer");
+    const output = entry.name === `${RUNTIME_PREFIX}woditor.wasm`
+      ? patchBrowserWoditorResolution(content)
+      : content;
+    await writeFile(outputPath, output);
   }
 }
 
