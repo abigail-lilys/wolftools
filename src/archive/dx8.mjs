@@ -1,5 +1,6 @@
 import { lstat, mkdir, open, readdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { removeUnpackProtection } from "./unpack-protection.mjs";
 
 import { DX8_MODES } from "../constants.mjs";
 import { applyWolfCryptV35, prepareWolfV35Archive } from "./wolfcrypt-v35.mjs";
@@ -20,6 +21,8 @@ const IO_SIZE = 1024 * 1024;
 const DEFAULT_KEY_STRING = Buffer.from("DXLIBARC", "latin1");
 const MAX_KEY_STRING = 63;
 const MAX_FILE_KEY_STRING = 2040;
+
+
 
 const CRC32_TABLE = Array.from({ length: 256 }, (_, value) => {
   let crc = value;
@@ -386,6 +389,7 @@ export async function unpackDx8Archive(archivePath, outputDir) {
           });
           await writeDecodedFile({ archive, header, file, key, outputPath: path });
           files += 1;
+          await removeUnpackProtection(path);
         }
       }
     }
