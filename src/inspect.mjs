@@ -1,8 +1,10 @@
 import { open, stat } from "node:fs/promises";
-import { basename, extname, relative, resolve } from "node:path";
+import { basename, dirname, extname, relative, resolve } from "node:path";
 
+import { detectDx5Header } from "./archive/dx5.mjs";
 import { detectDx6Header } from "./archive/dx6.mjs";
 import { inspectDx8Archive } from "./archive/dx8.mjs";
+import { findWolfProMode, isWolfProKeyArchive } from "./archive/wolf-pro.mjs";
 import { CRYPT_VERSION_NAMES } from "./constants.mjs";
 import { isArchivePath, listFiles, requireFile } from "./files.mjs";
 
@@ -24,10 +26,17 @@ async function scanExecutable(path) {
   let carry = "";
   try {
     while (true) {
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+      const { bytesRead } = await handle.read(
+        buffer,
+        0,
+        buffer.length,
+        position,
+      );
       if (bytesRead === 0) break;
       const text = carry + buffer.subarray(0, bytesRead).toString("latin1");
-      const version = text.match(/Game(?:Pro)?([0-9]+(?:\.[0-9]+)+)\.pdb/i)?.[1];
+      const version = text.match(
+        /Game(?:Pro)?([0-9]+(?:\.[0-9]+)+)\.pdb/i,
+      )?.[1];
       if (version) return version;
       carry = text.slice(-128);
       position += bytesRead;
@@ -38,7 +47,7 @@ async function scanExecutable(path) {
   }
 }
 
-export async function inspectFile(path) {
+export async function inspectFile(path, options = {}) {
   const file = await requireFile(path);
   const details = await stat(file);
   const start = await readStart(file);
@@ -61,14 +70,31 @@ export async function inspectFile(path) {
 
   if (!isArchivePath(file)) return result;
 
-  const clearHeader = start.length >= 49 && start.toString("ascii", 0, 2) === "DX";
+  if (isWolfProKeyArchive(file)) {
+    return {
+      ...result,
+      type: "wolf pro key archive",
+      native: true,
+    };
+  }
+
+  const clearHeader =
+    start.length >= 49 && start.toString("ascii", 0, 2) === "DX";
   if (!clearHeader) {
-    const native = start.length >= 48 ? detectDx6Header(start.subarray(0, 48), details.size) : undefined;
+    const dx5 =
+      start.length >= 28
+        ? detectDx5Header(start.subarray(0, 28), details.size)
+        : undefined;
+    const dx6 =
+      !dx5 && start.length >= 48
+        ? detectDx6Header(start.subarray(0, 48), details.size)
+        : undefined;
+    const native = dx5 || dx6;
     return {
       ...result,
       type: "wolf archive",
       header: native ? "encrypted" : "encrypted or obfuscated",
-      archiveVersion: native?.header ? 6 : undefined,
+      archiveVersion: dx5 ? 5 : dx6 ? 6 : undefined,
       cryptVersion: undefined,
       mode: native?.mode.label,
       native: Boolean(native),
@@ -79,8 +105,8 @@ export async function inspectFile(path) {
   const flags = start.readUInt32LE(44);
   const cryptVersion = flags >>> 16;
   let dx8;
-  if (archiveVersion === 8 && cryptVersion === 0) {
-    dx8 = await inspectDx8Archive(file).catch(() => undefined);
+  if (archiveVersion === 8) {
+    dx8 = await inspectDx8Archive(file, options).catch(() => undefined);
   }
   return {
     ...result,
@@ -97,26 +123,68 @@ export async function inspectPath(path) {
   const target = resolve(path);
   const details = await stat(target).catch(() => undefined);
   if (!details) throw new Error(`Path was not found: ${target}`);
-  if (details.isFile()) return [await inspectFile(target)];
+  if (details.isFile()) {
+    const initial = await inspectFile(target);
+    if (!isArchivePath(target) || isWolfProKeyArchive(target) || initial.native)
+      return [initial];
+    const proMode = await findWolfProMode(
+      dirname(target),
+      initial.cryptVersion,
+    );
+    return [
+      await inspectFile(target, proMode ? { modes: [proMode] } : undefined),
+    ];
+  }
 
   const files = await listFiles(target);
-  const relevant = files.filter((file) => isArchivePath(file) || /Game(?:Pro)?\.exe$/i.test(file));
-  const results = await Promise.all(relevant.map((file) => inspectFile(file)));
-  return results.map((result) => ({ ...result, path: relative(target, result.path) }));
+  const relevant = files.filter(
+    (file) => isArchivePath(file) || /Game(?:Pro)?\.exe$/i.test(file),
+  );
+  const keyArchive = relevant.find(isWolfProKeyArchive);
+  const dataArchive = relevant.find(
+    (file) => isArchivePath(file) && !isWolfProKeyArchive(file),
+  );
+  let proMode;
+  if (keyArchive && dataArchive) {
+    const start = await readStart(dataArchive);
+    const cryptVersion =
+      start.toString("ascii", 0, 2) === "DX" && start.length >= 48
+        ? start.readUInt32LE(44) >>> 16
+        : undefined;
+    proMode = await findWolfProMode(dirname(keyArchive), cryptVersion);
+  }
+  const results = await Promise.all(
+    relevant.map((file) =>
+      inspectFile(file, proMode ? { modes: [proMode] } : undefined),
+    ),
+  );
+  return results.map((result) => ({
+    ...result,
+    path: relative(target, result.path),
+  }));
 }
 
 export function formatInspection(results) {
-  if (results.length === 0) return "No WOLF archives or game executable were found.";
+  if (results.length === 0)
+    return "No WOLF archives or game executable were found.";
   return results
     .map((result) => {
-      const lines = [result.path, `  Type: ${result.type}`, `  Size: ${result.bytes} bytes`];
+      const lines = [
+        result.path,
+        `  Type: ${result.type}`,
+        `  Size: ${result.bytes} bytes`,
+      ];
       if (result.editorVersion) lines.push(`  Editor: ${result.editorVersion}`);
-      if (result.pro !== undefined) lines.push(`  Pro: ${result.pro ? "yes" : "no"}`);
+      if (result.pro !== undefined)
+        lines.push(`  Pro: ${result.pro ? "yes" : "no"}`);
       if (result.header) lines.push(`  Header: ${result.header}`);
-      if (result.archiveVersion !== undefined) lines.push(`  DX archive: ${result.archiveVersion}`);
-      if (result.cryptVersion !== undefined) lines.push(`  Crypt value: ${result.cryptVersion}`);
+      if (result.archiveVersion !== undefined)
+        lines.push(`  DX archive: ${result.archiveVersion}`);
+      if (result.cryptVersion !== undefined)
+        lines.push(`  Crypt value: ${result.cryptVersion}`);
       if (result.mode) lines.push(`  Mode: ${result.mode}`);
-      if (result.native !== undefined) lines.push(`  Native support: ${result.native ? "yes" : "not yet"}`);
+      if (result.native !== undefined)
+        lines.push(`  Native support: ${result.native ? "yes" : "not yet"}`);
       return lines.join("\n");
     })
     .join("\n\n");

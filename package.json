@@ -19,6 +19,7 @@
     "start": "node bin/wolftools.mjs",
     "test": "vitest run",
     "web": "node bin/wolftools.mjs web",
+    "serve": "node bin/wolftools.mjs serve",
     "inspect": "node bin/wolftools.mjs inspect",
     "unpack": "node bin/wolftools.mjs unpack",
     "pack": "node bin/wolftools.mjs pack"

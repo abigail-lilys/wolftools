@@ -2,12 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   access,
   cp,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
   readdir,
   rename,
   rm,
+  rmdir,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -18,6 +20,8 @@ import JSZip from "jszip";
 
 import { packDx8NoKeyArchive } from "./archive/dx8.mjs";
 import { unpackWolf } from "./unpack.mjs";
+import { isArchivePath } from "./files.mjs";
+import { inspectFile } from "./inspect.mjs";
 
 export const BROWSER_WODITOR_VERSION = "0.6.2.0";
 export const BROWSER_WODITOR_URL =
@@ -87,13 +91,18 @@ function webPath(path) {
   return path.split(sep).join("/");
 }
 
-async function listFiles(root, current = root) {
+async function listFiles(root, current = root, { rejectLinks = false } = {}) {
   const entries = await readdir(current, { withFileTypes: true });
   const files = [];
-  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+  for (const entry of entries.sort((left, right) =>
+    left.name.localeCompare(right.name),
+  )) {
     const path = join(current, entry.name);
+    if (rejectLinks && entry.isSymbolicLink()) {
+      throw new Error(`Shared game assets cannot be symbolic links: ${path}`);
+    }
     if (entry.isDirectory()) {
-      files.push(...(await listFiles(root, path)));
+      files.push(...(await listFiles(root, path, { rejectLinks })));
     } else if (entry.isFile()) {
       files.push(webPath(relative(root, path)));
     }
@@ -110,10 +119,14 @@ async function loadRuntimeZip({ runtimeZipPath, runtimeUrl, runtimeSha256 }) {
   if (runtimeZipPath) {
     bytes = await readFile(resolve(runtimeZipPath));
   } else {
-    process.stdout.write(`Downloading Browser Woditor ${BROWSER_WODITOR_VERSION}...\n`);
+    process.stdout.write(
+      `Downloading Browser Woditor ${BROWSER_WODITOR_VERSION}...\n`,
+    );
     const response = await fetch(runtimeUrl, { redirect: "follow" });
     if (!response.ok) {
-      throw new Error(`Browser Woditor download failed (${response.status} ${response.statusText}).`);
+      throw new Error(
+        `Browser Woditor download failed (${response.status} ${response.statusText}).`,
+      );
     }
     bytes = Buffer.from(await response.arrayBuffer());
   }
@@ -137,7 +150,9 @@ async function extractRuntime(zip, outputDir) {
   if (!entries.some((entry) => entry.name === `${RUNTIME_PREFIX}index.html`)) {
     throw new Error("The runtime ZIP does not contain public/index.html.");
   }
-  if (!entries.some((entry) => entry.name === `${RUNTIME_PREFIX}woditor.wasm`)) {
+  if (
+    !entries.some((entry) => entry.name === `${RUNTIME_PREFIX}woditor.wasm`)
+  ) {
     throw new Error("The runtime ZIP does not contain public/woditor.wasm.");
   }
 
@@ -150,7 +165,9 @@ async function extractRuntime(zip, outputDir) {
 
 async function browserWoditorMarker(zip) {
   const marker = Object.values(zip.files).find(
-    (entry) => !entry.dir && entry.name.replaceAll("\\", "/").endsWith("/BrowserWoditor.dat"),
+    (entry) =>
+      !entry.dir &&
+      entry.name.replaceAll("\\", "/").endsWith("/BrowserWoditor.dat"),
   );
   if (!marker) {
     throw new Error("The runtime ZIP does not contain BrowserWoditor.dat.");
@@ -158,16 +175,17 @@ async function browserWoditorMarker(zip) {
   return marker.async("nodebuffer");
 }
 
-export function lazyAssetLoaderSource() {
+export function lazyAssetLoaderSource({ sharedAssets = false } = {}) {
   return `(() => {
   const loaderScript = document.currentScript;
   if (!loaderScript?.src) {
     throw new Error("Could not determine the WOLF game folder URL.");
   }
-  const gameRoot = new URL("../", loaderScript.src);
+  const exportRoot = new URL("../", loaderScript.src);
+  const gameRoot = new URL(${JSON.stringify(sharedAssets ? "../" : "./")}, exportRoot);
 
   function readManifest() {
-    const manifestUrl = new URL("asset_manifest.json", gameRoot);
+    const manifestUrl = new URL("asset_manifest.json", exportRoot);
     const request = new XMLHttpRequest();
     request.open("GET", manifestUrl.href, false);
     request.send(null);
@@ -245,7 +263,8 @@ export function lazyAssetLoaderSource() {
       if (
         lower.includes("data/") &&
         /\.[^/.]{1,8}$/u.test(requested) &&
-        !/-(?:gamecache|save)\//iu.test(requested) &&
+        !lower.includes("-gamecache/") &&
+        !lower.includes("-save/") &&
         !lower.endsWith(".wolf") &&
         !lower.endsWith(".wolfx") &&
         !reportedMissing.has(lower)
@@ -282,6 +301,8 @@ export function lazyAssetLoaderSource() {
   }
 
   Module.preRun.push(() => {
+    // Shared support files (fonts/INI lists) live beside Game.exe, not in web/.
+    for (const path of manifest.preload || []) load(path);
     const originalOpen = FS.open;
     const originalStat = FS.stat;
     const originalLstat = FS.lstat;
@@ -306,17 +327,25 @@ export function lazyAssetLoaderSource() {
 `;
 }
 
-async function addLazyAssetLoader(outputDir) {
+async function addLazyAssetLoader(outputDir, options) {
   const indexPath = join(outputDir, "index.html");
   const index = await readFile(indexPath, "utf8");
-  const woditorScript = /<script\b[^>]*\bsrc=["']woditor\.js["'][^>]*><\/script>/i;
+  const woditorScript =
+    /<script\b[^>]*\bsrc=["']woditor\.js["'][^>]*><\/script>/i;
   if (!woditorScript.test(index)) {
     throw new Error("The runtime index does not load woditor.js.");
   }
-  const loaderTag = '<script type="text/javascript" src="lib/lazy_assets.js"></script>';
-  await writeFile(indexPath, index.replace(woditorScript, `${loaderTag}\n  $&`));
+  const loaderTag =
+    '<script type="text/javascript" src="lib/lazy_assets.js"></script>';
+  await writeFile(
+    indexPath,
+    index.replace(woditorScript, `${loaderTag}\n  $&`),
+  );
   await mkdir(join(outputDir, "lib"), { recursive: true });
-  await writeFile(join(outputDir, "lib", "lazy_assets.js"), lazyAssetLoaderSource());
+  await writeFile(
+    join(outputDir, "lib", "lazy_assets.js"),
+    lazyAssetLoaderSource(options),
+  );
 }
 
 export function safeProjectId(input) {
@@ -347,24 +376,37 @@ function settingsSource(projectId, title) {
 async function normalizeSourceDir(sourcePath) {
   const input = resolve(sourcePath);
   const details = await stat(input).catch(() => undefined);
-  if (!details) throw new Error(`Game or prepared release was not found: ${input}`);
+  if (!details)
+    throw new Error(`Game or prepared release was not found: ${input}`);
   if (details.isDirectory()) return input;
-  if (details.isFile() && /Game(?:Pro)?\.exe$/i.test(basename(input))) return dirname(input);
-  throw new Error("Web input must be a game folder, Game.exe, GamePro.exe, or prepared release.");
+  if (details.isFile() && /Game(?:Pro)?\.exe$/i.test(basename(input)))
+    return dirname(input);
+  throw new Error(
+    "Web input must be a game folder, Game.exe, GamePro.exe, or prepared release.",
+  );
 }
 
 async function sourceKind(sourceDir) {
   await requireDirectory(sourceDir, "Game or prepared release folder");
   for (const name of ["Game.exe", "GamePro.exe"]) {
     if (await exists(join(sourceDir, name))) {
-      if (!(await exists(join(sourceDir, "Data"))) && !(await exists(join(sourceDir, "Data.wolf")))) {
+      const hasData = await exists(join(sourceDir, "Data"));
+      const hasDataArchive = await exists(join(sourceDir, "Data.wolf"));
+      const hasOtherArchive =
+        !hasData &&
+        !hasDataArchive &&
+        (await containsArchives(sourceDir, await listFiles(sourceDir)));
+      if (!hasData && !hasDataArchive && !hasOtherArchive) {
         throw new Error("The game has neither a Data folder nor Data.wolf.");
       }
       return "native";
     }
   }
 
-  await requireFile(join(sourceDir, "Data.wolf"), "Browser Woditor ready Data.wolf");
+  await requireFile(
+    join(sourceDir, "Data.wolf"),
+    "Browser Woditor ready Data.wolf",
+  );
   await requireFile(join(sourceDir, "Game.ini"), "Game.ini");
   return "prepared";
 }
@@ -379,7 +421,10 @@ async function copyPreparedRelease(sourceDir, outputDir) {
 
   const saveDir = join(sourceDir, "Save");
   if (await exists(saveDir)) {
-    await cp(saveDir, join(outputDir, "Save"), { recursive: true, dereference: true });
+    await cp(saveDir, join(outputDir, "Save"), {
+      recursive: true,
+      dereference: true,
+    });
   }
 }
 
@@ -393,7 +438,10 @@ async function copyGameSupportFiles(sourceDir, outputDir) {
 
   const saveDir = join(sourceDir, "Save");
   if (await exists(saveDir)) {
-    await cp(saveDir, join(outputDir, "Save"), { recursive: true, dereference: true });
+    await cp(saveDir, join(outputDir, "Save"), {
+      recursive: true,
+      dereference: true,
+    });
   }
 }
 
@@ -409,18 +457,45 @@ async function createAssetManifest(dataDir) {
   return { version: 1, files, bytes };
 }
 
+async function findArchives(root, files) {
+  const archives = [];
+  for (const path of files.filter(
+    (path) => isArchivePath(path) || /\.wolfx?$/iu.test(path),
+  )) {
+    // .bin/.data can also be ordinary game assets; don't reject those by
+    // extension alone. Known WOLF names or detected archive headers count.
+    if (
+      /\.wolfx?$/iu.test(path) ||
+      (await inspectFile(join(root, path))).native
+    )
+      archives.push(path);
+  }
+  return archives;
+}
+
+async function containsArchives(root, files) {
+  return (await findArchives(root, files)).length > 0;
+}
+
 async function createLooseBrowserData(sourceDir, outputDir, runtimeZip) {
   const workRoot = await mkdtemp(join(tmpdir(), "wolftools web "));
   const unpackedGame = join(workRoot, "game");
   const bootData = join(workRoot, "boot");
   try {
-    process.stdout.write("Unpacking source archives...\n");
-    await unpackWolf({ sourcePath: sourceDir, outputDir: unpackedGame });
-    const dataDir = join(unpackedGame, "Data");
+    const sourceFiles = await listFiles(sourceDir);
+    const hasArchives = await containsArchives(sourceDir, sourceFiles);
+    if (hasArchives) {
+      process.stdout.write("Unpacking source archives...\n");
+      await unpackWolf({ sourcePath: sourceDir, outputDir: unpackedGame });
+    }
+    const dataDir = join(hasArchives ? unpackedGame : sourceDir, "Data");
     await requireDirectory(dataDir, "Unpacked Data folder");
 
     process.stdout.write("Copying browser assets...\n");
-    await cp(dataDir, join(outputDir, "Data"), { recursive: true, dereference: true });
+    await cp(dataDir, join(outputDir, "Data"), {
+      recursive: true,
+      dereference: true,
+    });
     const manifest = await createAssetManifest(join(outputDir, "Data"));
     await writeFile(
       join(outputDir, "asset_manifest.json"),
@@ -429,7 +504,10 @@ async function createLooseBrowserData(sourceDir, outputDir, runtimeZip) {
 
     const markerDir = join(bootData, "BasicData");
     await mkdir(markerDir, { recursive: true });
-    await writeFile(join(markerDir, "BrowserWoditor.dat"), await browserWoditorMarker(runtimeZip));
+    await writeFile(
+      join(markerDir, "BrowserWoditor.dat"),
+      await browserWoditorMarker(runtimeZip),
+    );
 
     process.stdout.write("Creating the small browser startup archive...\n");
     await rm(join(outputDir, "Data.wolf"), { force: true });
@@ -442,35 +520,175 @@ async function createLooseBrowserData(sourceDir, outputDir, runtimeZip) {
   }
 }
 
+async function validateSharedGame(sourceDir, kind) {
+  if (kind !== "native") {
+    throw new Error(
+      "Combined mode requires a game folder with Game.exe or GamePro.exe and unpacked Data assets.",
+    );
+  }
+  const dataDir = join(sourceDir, "Data");
+  await requireDirectory(
+    dataDir,
+    "Unpacked Data folder (unpack the game first)",
+  );
+  if ((await lstat(dataDir)).isSymbolicLink()) {
+    throw new Error("Shared Data folder cannot be a symbolic link.");
+  }
+  const dataFiles = await listFiles(dataDir, dataDir, { rejectLinks: true });
+  const entries = await readdir(sourceDir, { withFileTypes: true });
+  const files = [
+    ...entries.filter((entry) => entry.isFile()).map((entry) => entry.name),
+    ...dataFiles.map((path) => `Data/${path}`),
+  ];
+  if (await containsArchives(sourceDir, files)) {
+    throw new Error(
+      "Combined mode requires unpacked assets without packed archives. Run wolftools web in an interactive terminal and confirm extraction first.",
+    );
+  }
+  if (dataFiles.length === 0) throw new Error("Shared Data folder is empty.");
+}
+
+export async function inspectCombinedGame(sourcePath) {
+  const sourceDir = await normalizeSourceDir(sourcePath);
+  if ((await readdir(sourceDir)).some((name) => name.toLowerCase() === "web")) {
+    throw new Error(
+      `Game folder already contains web/: ${join(sourceDir, "web")}`,
+    );
+  }
+  const kind = await sourceKind(sourceDir);
+  if (kind !== "native") {
+    throw new Error(
+      "Combined mode requires a game folder with Game.exe or GamePro.exe and unpacked Data assets.",
+    );
+  }
+  const files = await listFiles(sourceDir);
+  const archives = await findArchives(sourceDir, files);
+  return {
+    sourceDir,
+    needsExtraction: archives.length > 0,
+    archives,
+  };
+}
+
+async function createSharedBrowserData(sourceDir, outputDir, runtimeZip) {
+  const manifest = await createAssetManifest(join(sourceDir, "Data"));
+  manifest.preload = [];
+  // Keep tiny browser configuration separate. Fonts and other support assets
+  // share the originals, just like Data/, and are materialized in the VFS only.
+  const supportFiles = new Set([
+    ...SOURCE_FILES.filter(
+      (name) => !["Data.wolf", "Game.ini", "readme.html"].includes(name),
+    ),
+    ...(await readdir(sourceDir)).filter((name) =>
+      /\.(?:ttf|ttc|otf|sf2)$/iu.test(name),
+    ),
+  ]);
+  for (const filename of supportFiles) {
+    const path = join(sourceDir, filename);
+    const details = await lstat(path).catch(() => undefined);
+    if (!details) continue;
+    if (!details.isFile())
+      throw new Error(`Shared support asset must be a regular file: ${path}`);
+    manifest.files.push({ path: filename, bytes: details.size });
+    manifest.bytes += details.size;
+    manifest.preload.push(filename);
+    // Drop a bundled fallback when the shared game supplies this asset.
+    await rm(join(outputDir, filename), { force: true });
+  }
+  const sourceIni = join(sourceDir, "Game.ini");
+  const iniDetails = await lstat(sourceIni).catch(() => undefined);
+  if (iniDetails) {
+    if (!iniDetails.isFile())
+      throw new Error(`Game.ini must be a regular file: ${sourceIni}`);
+    await cp(sourceIni, join(outputDir, "Game.ini"));
+  }
+  await writeFile(
+    join(outputDir, "asset_manifest.json"),
+    `${JSON.stringify(manifest)}\n`,
+  );
+  const bootRoot = await mkdtemp(join(tmpdir(), "wolftools web boot "));
+  try {
+    await mkdir(join(bootRoot, "BasicData"));
+    await writeFile(
+      join(bootRoot, "BasicData", "BrowserWoditor.dat"),
+      await browserWoditorMarker(runtimeZip),
+    );
+    await rm(join(outputDir, "Data.wolf"), { force: true });
+    await packDx8NoKeyArchive(bootRoot, join(outputDir, "Data.wolf"));
+  } finally {
+    await rm(bootRoot, { recursive: true, force: true });
+  }
+  await addLazyAssetLoader(outputDir, { sharedAssets: true });
+  return manifest;
+}
+
 export async function packageWolfGame({
   sourceDir,
   outputDir,
   runtimeZipPath,
   runtimeUrl = BROWSER_WODITOR_URL,
   runtimeSha256 = BROWSER_WODITOR_SHA256,
+  separate = true,
 }) {
+  if (typeof separate !== "boolean")
+    throw new Error("separate must be true or false.");
   const source = await normalizeSourceDir(sourceDir);
-  const destination = resolve(outputDir || `${source} web`);
-  if (source === destination || destination.startsWith(`${source}${sep}`)) {
-    throw new Error("The output folder must be outside the prepared release folder.");
+  // Check before reading/downloading a runtime or starting any extraction.
+  if ((await readdir(source)).some((name) => name.toLowerCase() === "web")) {
+    throw new Error(
+      `Game folder already contains web/: ${join(source, "web")}`,
+    );
+  }
+  const destination = separate
+    ? resolve(outputDir || `${source} web`)
+    : join(source, "web");
+  if (!separate && outputDir && resolve(outputDir) !== destination) {
+    throw new Error(
+      `Combined mode output must be ${destination}. Omit the output folder or use that path.`,
+    );
+  }
+  if (
+    separate &&
+    (source === destination || destination.startsWith(`${source}${sep}`))
+  ) {
+    throw new Error(
+      "The output folder must be outside the prepared release folder.",
+    );
   }
   if (await exists(destination)) {
     throw new Error(`Output folder already exists: ${destination}`);
   }
 
   const kind = await sourceKind(source);
+  if (!separate) await validateSharedGame(source, kind);
   const gameTitle = basename(source).trim();
   const saveProjectId = safeProjectId(gameTitle);
-  const staging = join(dirname(destination), `.${basename(destination)}.tmp-${randomUUID()}`);
-  const runtimeZip = await loadRuntimeZip({ runtimeZipPath, runtimeUrl, runtimeSha256 });
+  const staging = join(
+    dirname(destination),
+    `.${basename(destination)}.tmp-${randomUUID()}`,
+  );
+  const runtimeZip = await loadRuntimeZip({
+    runtimeZipPath,
+    runtimeUrl,
+    runtimeSha256,
+  });
+  let reserved = false;
 
   try {
+    if (!separate) {
+      // Exclusive reservation closes the check/create race. Only this empty
+      // reservation is removed on failure; never recursively delete web/.
+      await mkdir(destination);
+      reserved = true;
+    }
     await mkdir(staging, { recursive: true });
     process.stdout.write("Preparing Browser Woditor runtime...\n");
     await extractRuntime(runtimeZip, staging);
     let data;
     if (kind === "native") {
-      const manifest = await createLooseBrowserData(source, staging, runtimeZip);
+      const manifest = separate
+        ? await createLooseBrowserData(source, staging, runtimeZip)
+        : await createSharedBrowserData(source, staging, runtimeZip);
       data = {
         delivery: "files",
         manifest: "asset_manifest.json",
@@ -478,6 +696,7 @@ export async function packageWolfGame({
         bootArchive: "Data.wolf",
         files: manifest.files.length,
         bytes: manifest.bytes,
+        ...(!separate ? { assetBase: "../", shared: true } : {}),
       };
     } else {
       process.stdout.write("Copying creator export...\n");
@@ -489,18 +708,32 @@ export async function packageWolfGame({
       await writeFile(join(staging, "Game.ini"), DEFAULT_GAME_INI);
     }
 
-    await writeFile(join(staging, "settings.js"), settingsSource(saveProjectId, gameTitle));
+    await writeFile(
+      join(staging, "settings.js"),
+      settingsSource(saveProjectId, gameTitle),
+    );
     await writeFile(
       join(staging, "browser-game.json"),
-      `${JSON.stringify({
-        title: gameTitle,
-        engine: "wolf-rpg",
-        runtime: `Browser Woditor ${BROWSER_WODITOR_VERSION}`,
-        data,
-      }, null, 2)}\n`,
+      `${JSON.stringify(
+        {
+          title: gameTitle,
+          engine: "wolf-rpg",
+          runtime: `Browser Woditor ${BROWSER_WODITOR_VERSION}`,
+          layout: separate ? "separate" : "combined",
+          data,
+        },
+        null,
+        2,
+      )}\n`,
     );
 
-    const downloadableFiles = ["Data.wolf", "DefaultSoundFont.sf2", "Game.ini"];
+    const sharedSoundFont =
+      !separate && (await exists(join(source, "DefaultSoundFont.sf2")));
+    const downloadableFiles = [
+      "Data.wolf",
+      ...(!sharedSoundFont ? ["DefaultSoundFont.sf2"] : []),
+      "Game.ini",
+    ];
     const saveFiles = (await exists(join(staging, "Save")))
       ? (await listFiles(join(staging, "Save"))).map((path) => `Save/${path}`)
       : [];
@@ -509,9 +742,23 @@ export async function packageWolfGame({
       `${[...downloadableFiles, ...saveFiles].join("\r\n")}\r\n`,
     );
 
-    await rename(staging, destination);
+    if (separate) {
+      await rename(staging, destination);
+    } else {
+      // Windows cannot rename over an existing directory, even our empty
+      // reservation. Publish into that exclusively-created folder without
+      // replacing any file another process might have placed there.
+      await cp(staging, destination, {
+        recursive: true,
+        force: false,
+        errorOnExist: true,
+      });
+      await rm(staging, { recursive: true, force: true });
+    }
+    reserved = false;
   } catch (error) {
     await rm(staging, { recursive: true, force: true });
+    if (reserved) await rmdir(destination).catch(() => {});
     throw error;
   }
 
@@ -520,5 +767,7 @@ export async function packageWolfGame({
     title: gameTitle,
     projectId: saveProjectId,
     sourceKind: kind,
+    separate,
+    serveRoot: separate ? destination : source,
   };
 }
