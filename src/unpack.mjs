@@ -63,9 +63,13 @@ async function unpackArchives(
   const outputs = [];
   for (const archive of archives) {
     if (proMode && isWolfProKeyArchive(archive)) continue;
-    const relativeParent = dirname(archive)
-      .slice(sourceFolder.length)
-      .replace(/^[/\\]+/, "");
+    const relativeParent = relative(sourceFolder, dirname(archive));
+    if (
+      relativeParent === ".." ||
+      relativeParent.startsWith(`..${sep}`)
+    ) {
+      throw new Error(`Archive is outside the source folder: ${archive}`);
+    }
     const output = join(destinationFolder, relativeParent, parse(archive).name);
     const result = await unpackArchive(
       archive,
@@ -195,6 +199,7 @@ export async function unpackWolfInPlace({ sourcePath, archivePaths }) {
     join(dirname(source), `.${basename(source)} extract `),
   );
   const moved = [];
+  const movedArchives = [];
   try {
     const result = await unpackArchives(source, staging, {
       archives,
@@ -206,13 +211,23 @@ export async function unpackWolfInPlace({ sourcePath, archivePaths }) {
       await rename(stagedPath, target);
       moved.push({ stagedPath, target });
     }
-    for (const archive of result.archives) await rm(archive);
+    const archivedRoot = join(staging, ".archives");
+    for (const archive of result.archives) {
+      const stagedArchive = join(archivedRoot, relative(source, archive));
+      await mkdir(dirname(stagedArchive), { recursive: true });
+      await rename(archive, stagedArchive);
+      movedArchives.push({ archive, stagedArchive });
+    }
     return {
       sourceDir: source,
       archives: result.archives.length,
       files: result.files,
     };
   } catch (error) {
+    for (const item of movedArchives.reverse()) {
+      await mkdir(dirname(item.archive), { recursive: true });
+      await rename(item.stagedArchive, item.archive).catch(() => undefined);
+    }
     for (const item of moved.reverse()) {
       await mkdir(dirname(item.stagedPath), { recursive: true });
       await rename(item.target, item.stagedPath).catch(() => undefined);

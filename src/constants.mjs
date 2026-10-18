@@ -1,5 +1,6 @@
 export const ARCHIVE_EXTENSIONS = new Set([
   ".wolf",
+  ".wolfx",
   ".data",
   ".pak",
   ".bin",

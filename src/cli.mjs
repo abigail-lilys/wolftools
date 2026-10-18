@@ -96,7 +96,10 @@ function webArguments(values) {
 
 export async function runCli(
   argv,
-  { confirmExtraction = askToExtractArchives } = {},
+  {
+    confirmExtraction = askToExtractArchives,
+    write = (message) => process.stdout.write(message),
+  } = {},
 ) {
   const [command = "help", ...values] = argv;
   if (command === "help") return helpText();
@@ -118,7 +121,7 @@ export async function runCli(
           sourcePath: state.sourceDir,
           archivePaths: state.archives,
         });
-        process.stdout.write(
+        write(
           `Extracted ${extracted.files} files and removed ${extracted.archives} archive${extracted.archives === 1 ? "" : "s"}.\n`,
         );
       }

@@ -57,23 +57,12 @@ function packArchive(sourceDir, archivePath, mode) {
 async function findGameExecutable(source) {
   const details = await stat(source).catch(() => undefined);
   if (!details) throw new Error(`Input was not found: ${source}`);
-  if (details.isFile() && /Game(?:Pro)?\.exe$/i.test(basename(source)))
-    return source;
-  if (!details.isDirectory())
+  if (details.isFile()) {
+    if (/Game(?:Pro)?\.exe$/i.test(basename(source))) return source;
     throw new Error(
       "Pack input must be Game.exe, GamePro.exe, or its project folder.",
     );
-  for (const name of ["GamePro.exe", "Game.exe"]) {
-    const candidate = join(source, name);
-    if (await exists(candidate)) return candidate;
   }
-  throw new Error(`Game.exe or GamePro.exe was not found in ${source}`);
-}
-
-async function findOptionalGameExecutable(source) {
-  const details = await stat(source).catch(() => undefined);
-  if (!details) throw new Error(`Input was not found: ${source}`);
-  if (details.isFile()) return findGameExecutable(source);
   if (!details.isDirectory())
     throw new Error("Pack input must be a folder or game executable.");
   for (const name of ["GamePro.exe", "Game.exe"]) {
@@ -102,7 +91,7 @@ async function copyReleaseFiles(stagedGame, destination) {
 
 export async function packWolf({ sourcePath, outputDir, modeName }) {
   const input = resolve(sourcePath);
-  const executable = await findOptionalGameExecutable(input);
+  const executable = await findGameExecutable(input);
   if (executable && basename(executable).toLowerCase() === "gamepro.exe") {
     throw new Error("WOLF RPG Editor Pro packing is not supported.");
   }

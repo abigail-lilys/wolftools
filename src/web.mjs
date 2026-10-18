@@ -458,19 +458,15 @@ async function createAssetManifest(dataDir) {
 }
 
 async function findArchives(root, files) {
-  const archives = [];
-  for (const path of files.filter(
-    (path) => isArchivePath(path) || /\.wolfx?$/iu.test(path),
-  )) {
-    // .bin/.data can also be ordinary game assets; don't reject those by
-    // extension alone. Known WOLF names or detected archive headers count.
-    if (
-      /\.wolfx?$/iu.test(path) ||
-      (await inspectFile(join(root, path))).native
-    )
-      archives.push(path);
-  }
-  return archives;
+  const candidates = files.filter(isArchivePath);
+  const matches = await Promise.all(
+    candidates.map(async (path) =>
+      /\.wolfx?$/iu.test(path) || (await inspectFile(join(root, path))).native,
+    ),
+  );
+  // .bin and .data can also be ordinary assets. Only detected archive
+  // headers count for those extensions.
+  return candidates.filter((_path, index) => matches[index]);
 }
 
 async function containsArchives(root, files) {
