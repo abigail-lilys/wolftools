@@ -1,25 +1,18 @@
-# wolftools
+# wolftools (WIP)
 
-wolftools is a standalone command line tool for WOLF RPG Editor games. It can
-inspect WOLF files, prepare a Browser Woditor website, unpack supported archives,
-and create supported archives.
+wolftools is a command line tool for WOLF RPG Editor games. It can check game
+files, unpack supported archives, pack folders into archives, and create a
+website with Browser Woditor.
 
-## Use Case
+Use wolftools only with games you own or have permission to work with.
 
-WOLF RPG Editor creates Windows games. Browser Woditor provides the WebAssembly
-runtime needed to run a compatible creator export in a browser.
+## Choose a command
 
-wolftools brings the related tasks into one command.
-
-Use wolftools only with a game you own or are authorized to process.
-
-## App Flow
-
-1. Install wolftools.
-2. Inspect a game or archive when you need format information.
-3. Use web with a native game or Browser Woditor ready creator release.
-4. Use unpack to extract supported archives into a new folder.
-5. Use pack to create a release with supported WOLF archives.
+- `inspect` shows the game version and archive details it can detect.
+- `web` creates a [Browser Woditor](https://frostyhowl.com/browser-woditor/) website.
+- `unpack` extracts archive files into a new folder.
+- `pack` creates archives from folders.
+- `serve` starts a local web server for testing.
 
 ## Install
 
@@ -31,7 +24,7 @@ Install dependencies:
 pnpm install
 ```
 
-Make the command available on your computer:
+Make the `wolftools` command available on your computer:
 
 ```sh
 pnpm link -g
@@ -45,43 +38,82 @@ wolftools help
 
 ## Inspect
 
-Inspect a game folder, executable, or archive:
+Check a game folder, `Game.exe`, `GamePro.exe`, or an archive:
 
 ```sh
 wolftools inspect "/path/to/Game"
 ```
 
-The report shows detected executables, archive headers, DX archive versions,
-known encryption modes, and whether the archive has native support.
+The report shows the versions, archive types, and encryption modes it can
+detect. It also shows whether wolftools supports the archive format.
 
-## Export to a Website
+## Create a website
 
-Create a website directly from a game folder:
+### Create a separate copy
+
+By default, `web` creates a new folder and does not change the original game:
 
 ```sh
 wolftools web "/path/to/Game" "./output/Web Game"
 ```
 
-wolftools finds `Game.exe` or `GamePro.exe`, unpacks the supported WOLF
-archives, adds the Browser Woditor marker, and writes the game files into the
-website. It accepts games with a Data folder and games with one `Data.wolf`
-beside the executable. If an older game has no `Game.ini`, wolftools creates a
-safe default for the browser export. The original game is not changed.
+This is the same as using `--separate=true`. If you leave out the output path,
+the tool adds ` web` to the game folder's name.
 
-Native games use asset by asset loading. The website has a small `Data.wolf`
-startup archive containing only the Browser Woditor marker. Maps, images,
-audio, and game databases are separate files under `Data`. wolftools adds a
-manifest and a loader that gives Browser Woditor each file when the game first opens it.
+wolftools finds `Game.exe` or `GamePro.exe` and extracts supported archives.
+It accepts a game with a `Data/` folder or a `Data.wolf` archive.
 
-This avoids downloading the complete game at startup. A file can cause a short
-pause the first time the game needs it, especially for large audio or video.
-The browser cache can reuse downloaded files on later visits.
+If `Game.ini` is missing, the tool creates a default one for the website.
 
-For offline use, add the path to a Browser Woditor ZIP as the third value:
+### Share one game folder
+
+Use `--separate=false` to keep the Windows EXE and website in the same game
+folder:
+
+```sh
+wolftools web "/path/to/Game" --separate=false
+wolftools serve "/path/to/Game"
+```
+
+This adds a `web/` folder. The EXE and browser both use the existing `Data/`
+folder.
+
+Combined mode needs unpaced archives in `Data/`. If the game still uses archives,
+wolftools asks if you want to extract them. The default answer is no.
+
+If you answer yes, wolftools extracts the files into the original game folder
+and removes the packed archives. This changes the original game. It may break
+some games, especially Pro games and games with custom protection. Make a
+backup before you agree. Automatic extraction stops if it would overwrite an
+existing file or folder.
+
+If the game folder already contains `web/`, the command stops and does not
+overwrite it.
+
+### Use a local Browser Woditor ZIP
+
+To use a ZIP you already downloaded, add its path as the third value:
 
 ```sh
 wolftools web "/path/to/Game" "./output/Web Game" "/path/to/BrowserWoditor.zip"
 ```
+
+For combined mode:
+
+```sh
+wolftools web "/path/to/Game" "/path/to/Game/web" "/path/to/BrowserWoditor.zip" --separate=false
+```
+
+### Test the website
+
+For a web export:
+
+```sh
+wolftools serve "./output/Web Game"
+```
+
+The server returns the link to open. Copy and paste it in the URL address bar.
+Click or tap the game screen once to let the browser start audio and the game.
 
 ## Unpack
 
@@ -97,15 +129,32 @@ Unpack the archives found through a game executable:
 wolftools unpack "/path/to/Game.exe" "./output/Unpacked Game"
 ```
 
-wolftools supports packing and unpacking native DX version 6 archives created
-with WOLF RPG Editor 2.20. This includes encrypted archives and compressed file
-data.
+These standard WOLF archive formats are supported. This table does not mean
+that Pro packing is supported.
 
-Unpack also supports standard DX version 8 archives compatible with WOLF RPG
-Editor 2.281, 3.10, and 3.173. It handles encrypted and compressed archive
-tables, individual file keys, LZ data, Huffman data, and partial Huffman data.
-It also accepts the clear DX version 8 archives created by the Web command.
-Windows, macOS, and Linux use the same JavaScript implementation.
+| Standard editor family | Archive format          | Pack | Unpack |
+| ---------------------- | ----------------------- | ---- | ------ |
+| 2.00-2.10              | DX5                     | Yes  | Yes    |
+| 2.20                   | DX6                     | Yes  | Yes    |
+| 2.225-2.296            | DX8 classic             | Yes  | Yes    |
+| 3.00-3.139             | DX8 classic             | Yes  | Yes    |
+| 3.14-3.30              | DX8 classic             | Yes  | Yes    |
+| 3.31-3.49              | DX8 modern encryption   | Yes  | Yes    |
+| 3.50+ archive family   | DX8 modern encryption   | Yes  | Yes    |
+| ChaCha2 variants       | DX8 ChaCha20 encryption | Yes  | Yes    |
+
+Support includes encrypted archive tables, file keys, LZ compression, Huffman
+compression, and partial Huffman compression.
+
+Pro archives need their matching key archive beside them. wolftools supports
+legacy Pro, Pro ChaCha2, and supported Pro 3.x key formats. You can pass a game
+folder, `GamePro.exe`, or a data archive with its key file nearby. Common key
+archive names include `Game`, `List`, `Data2`, `GameFile`, and `BasicData2`.
+
+Pro archive packing is not available. wolftools can unpack the archive layer
+of supported Pro releases when the matching key archive is present. It cannot
+remove separate protection from files stored inside a Pro archive. A custom or
+new Pro format may not work.
 
 ## Pack
 
@@ -115,14 +164,27 @@ Pack one folder into one archive:
 wolftools pack "/path/to/BasicData" 2.20 "./output/BasicData.wolf"
 ```
 
-Pack the subfolders inside a project Data folder:
+Choose another supported version:
 
 ```sh
-wolftools pack "/path/to/Game Project" 2.20 "./output/Packed Game"
+wolftools pack "/path/to/BasicData" 3.50 "./output/BasicData.wolf"
 ```
 
-The input folder needs `Game.exe` or `GamePro.exe` and a Data folder. The
-original project is not changed. The default mode is `2.20`.
+Pack the folders inside a game's `Data/` folder:
+
+```sh
+wolftools pack "/path/to/Game Project"
+```
+
+For a standard game folder, the tool needs `Game.exe` and a `Data/` folder with
+subfolders. It makes one archive for each subfolder. The original game is not
+changed. wolftools reads the editor version from `Game.exe` and chooses the
+matching pack mode when possible. If the version cannot be read, it uses
+`2.20`. A plain folder without `Game.exe` also uses `2.20` unless you give a
+mode.
+
+Packing a Pro game is not supported. The tool stops if the game uses
+`GamePro.exe`.
 
 Show all supported pack modes:
 
@@ -130,27 +192,20 @@ Show all supported pack modes:
 wolftools modes
 ```
 
-When the input is a game project, Pack creates one archive for each subfolder
-inside Data. Use the official WOLF RPG Editor Create Game Data feature when you
-need its complete desktop release workflow. The Web command creates the small
-startup archive and separate browser assets required for loading files as the
-game needs them.
-
-## Privacy
+## Privacy and licenses
 
 Game files stay on your computer. wolftools does not upload them.
 
-Browser Woditor is downloaded from its official project site when required. A
-checksum is verified before it is used. Pack and unpack do not use the network.
+[Browser Woditor](https://frostyhowl.com/browser-woditor/) is a separate project with its own license and usage rules.
+Its runtime files are not included in this repository.
 
 ## Notes
 
-Browser Woditor is a separate project with its own license and usage
-guidelines. Its runtime files are not included in this repository.
-
-Archive compatibility depends on the WOLF RPG Editor version and encryption
-mode. Some WOLF 3 releases, WOLF Pro releases, and games with custom protection
-use a different crypt format.
+- This is an unofficial player for user provided web game exports. It is not
+  affiliated with or endorsed by SmokingWOLF.
+- This project is a work in progress. The source code structure, features, and
+  supported formats may change over time. The approach to
+  [privacy](#privacy-and-licenses) will remain unchanged.
 
 ## Fork Features and Experimental Support
 

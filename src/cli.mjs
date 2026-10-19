@@ -1,23 +1,67 @@
+import { createInterface } from "node:readline/promises";
+
 import { PACK_MODES } from "./constants.mjs";
 import { formatInspection, inspectPath } from "./inspect.mjs";
 import { packWolf } from "./pack.mjs";
-import { unpackWolf } from "./unpack.mjs";
-import { packageWolfGame } from "./web.mjs";
+import { unpackWolf, unpackWolfInPlace } from "./unpack.mjs";
+import { inspectCombinedGame, packageWolfGame } from "./web.mjs";
+import { serveWebExport } from "./serve.mjs";
 
 export function helpText() {
-  return `Wolf Tools
+  return `wolftools
 
 Usage:
-  wolftools inspect <game, folder, or archive>
-  wolftools web <game or prepared release> [output folder] [runtime zip]
-  wolftools unpack <game, folder, or archive> [output folder]
+  wolftools inspect <game folder, EXE, or archive>
+  wolftools web <game folder or EXE> [output folder] [runtime zip] [--separate=true|false]
+  wolftools serve <website or combined game folder> [port]
+  wolftools unpack <game folder, EXE, or archive> [output folder]
   wolftools pack <folder, game, or project> [mode] [output]
   wolftools modes
   wolftools help
 
-The default pack mode is 2.20.
+Web options:
+  --separate=true   Create a new website folder. Do not change the game. (default)
+  --separate=false  Add web/ to the game folder. Share its existing Data/ assets.
 
-Use these commands only with games you own or are authorized to process.`;
+Combined mode needs Game.exe or GamePro.exe and an unpacked Data/ folder.
+If archives are found, wolftools asks before extracting them in the game folder.
+This removes the archives and may break the game. Make a backup first.
+Both modes stop with an error if the game already has web/.
+Serve a combined game from its game folder, not only web/.
+
+Examples:
+  wolftools web "/path/to/Game" "./output/Web Game"
+  wolftools web "/path/to/Game" --separate=false
+  wolftools serve "/path/to/Game"
+
+Pack detects the mode from Game.exe when possible. A plain folder uses 2.20.
+WOLF RPG Editor Pro packing is not supported. The default server port is 4177.
+Browser playback depends on the game and Browser Woditor.
+
+Use these commands only with games you own or have permission to work with.`;
+}
+
+async function askToExtractArchives({ archives }) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error(
+      "Archive extraction needs confirmation in an interactive terminal.",
+    );
+  }
+  process.stdout.write(
+    `\nThe game has ${archives.length} packed archive${archives.length === 1 ? "" : "s"}.\n` +
+      "Combined mode needs unpacked archives. Extraction will make changes to the original game and removes the archives.\n" +
+      "Warning: this may break the game, especially a Pro or protected game. Make a backup first.\n",
+  );
+  const prompt = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  try {
+    const answer = await prompt.question("Extract the archives now? [y/N] ");
+    return /^(?:y|yes)$/iu.test(answer.trim());
+  } finally {
+    prompt.close();
+  }
 }
 
 function requireCount(command, values, minimum, maximum) {
@@ -26,7 +70,37 @@ function requireCount(command, values, minimum, maximum) {
   }
 }
 
-export async function runCli(argv) {
+function webArguments(values) {
+  const positional = [];
+  let separate = true;
+  let seen = false;
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+    if (value === "--separate" || value.startsWith("--separate=")) {
+      if (seen) throw new Error("--separate may only be specified once.");
+      const raw =
+        value === "--separate"
+          ? values[++index]
+          : value.slice("--separate=".length);
+      if (raw !== "true" && raw !== "false")
+        throw new Error("--separate must be true or false.");
+      separate = raw === "true";
+      seen = true;
+    } else if (value.startsWith("--")) {
+      throw new Error(`Unknown web option: ${value}`);
+    } else positional.push(value);
+  }
+  requireCount("web", positional, 1, 3);
+  return { positional, separate };
+}
+
+export async function runCli(
+  argv,
+  {
+    confirmExtraction = askToExtractArchives,
+    write = (message) => process.stdout.write(message),
+  } = {},
+) {
   const [command = "help", ...values] = argv;
   if (command === "help") return helpText();
   if (command === "modes") {
@@ -37,17 +111,43 @@ export async function runCli(argv) {
     return formatInspection(await inspectPath(values[0]));
   }
   if (command === "web") {
-    requireCount(command, values, 1, 3);
+    const { positional, separate } = webArguments(values);
+    if (!separate) {
+      const state = await inspectCombinedGame(positional[0]);
+      if (state.needsExtraction) {
+        if (!(await confirmExtraction(state)))
+          return "Cancelled. No files were changed.";
+        const extracted = await unpackWolfInPlace({
+          sourcePath: state.sourceDir,
+          archivePaths: state.archives,
+        });
+        write(
+          `Extracted ${extracted.files} files and removed ${extracted.archives} archive${extracted.archives === 1 ? "" : "s"}.\n`,
+        );
+      }
+    }
     const result = await packageWolfGame({
-      sourceDir: values[0],
-      outputDir: values[1],
-      runtimeZipPath: values[2],
+      sourceDir: positional[0],
+      outputDir: positional[1],
+      runtimeZipPath: positional[2],
+      separate,
     });
     return `Created web export for ${result.title}.\nOutput: ${result.outputDir}`;
   }
+  if (command === "serve") {
+    requireCount(command, values, 1, 2);
+    const result = await serveWebExport({
+      rootDir: values[0],
+      port: values[1] ?? 4177,
+    });
+    return `Serving ${result.root}\nOpen: ${result.url}`;
+  }
   if (command === "unpack") {
     requireCount(command, values, 1, 2);
-    const result = await unpackWolf({ sourcePath: values[0], outputDir: values[1] });
+    const result = await unpackWolf({
+      sourcePath: values[0],
+      outputDir: values[1],
+    });
     return `Unpacked ${result.files} files.\nOutput: ${result.outputDir}`;
   }
   if (command === "pack") {
